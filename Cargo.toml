@@ -1,0 +1,30 @@
+[package]
+name = "fast-job-queue"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "A simple, async job queue with pluggable storage backends"
+repository = "https://github.com/francis2tm/fast-job-queue"
+keywords = ["job", "queue", "async", "worker", "background"]
+categories = ["asynchronous", "concurrency"]
+readme = "README.md"
+
+[features]
+default = ["postgres"]
+postgres = ["dep:diesel", "dep:diesel-async"]
+
+[dependencies]
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0"
+diesel = { version = "2", optional = true }
+diesel-async = { version = "0", optional = true }
+
+[dev-dependencies]
+dotenvy = "0"
+serial_test = "3"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0"
+futures = "0"
+tokio-test = "0"
