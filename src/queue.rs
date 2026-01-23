@@ -8,22 +8,16 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{debug, error};
 
-use crate::Job;
+use crate::{Job, Storage};
 
 /// Errors that can occur when using the job queue.
 #[derive(Debug, Error)]
 pub enum JobQueueError {
     /// Configuration error (e.g., zero workers, zero poll interval).
-    ///
-    /// This error is returned when [`JobQueue::new`] is called with invalid
-    /// configuration values.
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
 
     /// A worker panicked during execution.
-    ///
-    /// This error is returned during [`JobQueue::shutdown`] if a worker task
-    /// panicked while processing a job.
     #[error("Worker panicked: {0}")]
     WorkerPanicked(String),
 }
@@ -48,23 +42,13 @@ pub enum JobQueueError {
 #[derive(Clone, Debug)]
 pub struct JobQueueConfig {
     /// Number of concurrent worker tasks.
-    ///
-    /// Each worker independently polls for and processes jobs.
-    /// More workers allow higher throughput but consume more resources.
     pub workers: usize,
 
     /// How long to wait between polls when no jobs are available.
-    ///
-    /// Lower values mean faster response to new jobs but higher CPU usage.
-    /// Higher values reduce CPU usage but increase latency for new jobs.
     pub poll_interval: Duration,
 }
 
 impl Default for JobQueueConfig {
-    /// Returns a configuration with sensible defaults.
-    ///
-    /// - `workers`: 4
-    /// - `poll_interval`: 1 second
     fn default() -> Self {
         Self {
             workers: 4,
@@ -73,41 +57,41 @@ impl Default for JobQueueConfig {
     }
 }
 
-/// A storage-agnostic async job queue with configurable workers.
+/// A storage-backed async job queue with configurable workers.
 ///
-/// The job queue spawns multiple worker tasks that poll for jobs from a storage
-/// backend and execute them concurrently.
+/// The job queue spawns multiple worker tasks that poll for jobs from storage
+/// and execute them concurrently.
 ///
 /// # Type Parameters
 ///
-/// When creating a queue with [`JobQueue::new`], you specify:
-/// - `J` - The job type implementing [`Job<S>`]
-/// - `S` - The storage backend implementing [`Storage`]
+/// * `S` - The storage backend implementing [`Storage`]
 ///
 /// # Lifecycle
 ///
 /// 1. Create with [`JobQueue::new`]
-/// 2. Workers automatically start polling and processing jobs
+/// 2. Workers automatically start polling and processing jobs via `storage.pop()`
 /// 3. Call [`JobQueue::shutdown`] to gracefully stop all workers
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// use fast_job_queue::{JobQueue, JobQueueConfig};
+/// use fast_job_queue::{JobQueue, JobQueueConfig, MemoryStorage};
 ///
-/// let queue = JobQueue::new::<MyJob, MyStorage>(storage, JobQueueConfig::default())?;
+/// let storage = MemoryStorage::new();
+/// let queue = JobQueue::new(storage, JobQueueConfig::default())?;
 ///
 /// // Queue processes jobs in the background...
 ///
 /// queue.shutdown().await?;
 /// ```
-pub struct JobQueue {
+pub struct JobQueue<S: Storage> {
+    storage: S,
     workers: Vec<JoinHandle<()>>,
     shutdown_tx: broadcast::Sender<()>,
 }
 
-impl JobQueue {
-    /// Create a new job queue that processes jobs of type `J` using storage `S`.
+impl<S: Storage> JobQueue<S> {
+    /// Create a new job queue with the given storage backend.
     ///
     /// This spawns `config.workers` background tasks that poll for jobs.
     ///
@@ -117,11 +101,7 @@ impl JobQueue {
     /// - `workers` is 0
     /// - `poll_interval` is 0
     #[must_use = "job queue must be stored to keep workers running"]
-    pub fn new<J, S>(storage: S, config: JobQueueConfig) -> Result<Self, JobQueueError>
-    where
-        J: Job<S>,
-        S: Clone + Send + Sync + 'static,
-    {
+    pub fn new(storage: S, config: JobQueueConfig) -> Result<Self, JobQueueError> {
         if config.workers == 0 {
             return Err(JobQueueError::InvalidConfig(
                 "workers must be greater than 0".into(),
@@ -152,13 +132,24 @@ impl JobQueue {
                         break;
                     }
 
-                    // Fetch and claim a single job from storage
-                    match J::fetch_and_claim(&storage).await {
+                    // Pop (claim) the next pending job from storage
+                    match storage.pop().await {
                         Ok(Some(job)) => {
                             debug!(worker_id = worker_id, "Worker claimed job");
 
-                            // Execute the job
-                            job.execute(&storage).await;
+                            // Execute the job and log any errors
+                            match job.execute(&storage).await {
+                                Ok(()) => {
+                                    debug!(worker_id = worker_id, "Job completed successfully");
+                                }
+                                Err(e) => {
+                                    error!(
+                                        worker_id = worker_id,
+                                        error = %e,
+                                        "Job execution failed"
+                                    );
+                                }
+                            }
                         }
                         Ok(None) => {
                             // No jobs available, wait before polling again
@@ -168,7 +159,7 @@ impl JobQueue {
                             error!(
                                 worker_id = worker_id,
                                 error = %e,
-                                "Failed to fetch jobs"
+                                "Failed to pop job from storage"
                             );
                             tokio::time::sleep(config.poll_interval).await;
                         }
@@ -182,25 +173,24 @@ impl JobQueue {
         }
 
         Ok(Self {
+            storage,
             workers,
             shutdown_tx,
         })
+    }
+
+    /// Get a reference to the storage backend.
+    pub fn storage(&self) -> &S {
+        &self.storage
     }
 
     /// Gracefully shutdown the queue.
     ///
     /// This signals all workers to stop and waits for them to finish processing
     /// their current jobs.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JobQueueError::WorkerPanicked`] if any worker panicked during
-    /// execution.
     pub async fn shutdown(self) -> Result<(), JobQueueError> {
-        // Send shutdown signal to all workers
         let _ = self.shutdown_tx.send(());
 
-        // Wait for all workers to complete
         for (idx, handle) in self.workers.into_iter().enumerate() {
             handle.await.map_err(|e| {
                 JobQueueError::WorkerPanicked(format!("Worker {} panicked: {}", idx, e))
@@ -212,14 +202,6 @@ impl JobQueue {
     }
 
     /// Attempt to shutdown an `Arc<JobQueue>` if it's the last reference.
-    ///
-    /// This is useful for graceful shutdown in application cleanup code where
-    /// the queue may still have active references.
-    ///
-    /// # Behavior
-    ///
-    /// - If this is the last `Arc` reference, shutdowns the queue and awaits completion
-    /// - If other references exist, logs a warning and returns without shutdown
     pub async fn shutdown_arc(self: Arc<Self>) {
         tracing::info!("Shutting down job queue...");
         match Arc::try_unwrap(self) {
@@ -244,7 +226,7 @@ impl JobQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Job, MemoryStorage};
+    use crate::{Job, MemoryStorage, Storage};
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -274,20 +256,15 @@ mod tests {
     // Validation Tests
     // =========================================================================
 
-    // Simple job type for validation tests (doesn't need counter)
     #[derive(Debug, Clone)]
     struct SimpleJob;
 
     impl Job<MemoryStorage<SimpleJob>> for SimpleJob {
         type Error = Infallible;
 
-        async fn fetch_and_claim(
-            storage: &MemoryStorage<SimpleJob>,
-        ) -> Result<Option<Self>, Infallible> {
-            Ok(storage.pop().await)
+        async fn execute(self, _storage: &MemoryStorage<SimpleJob>) -> Result<(), Infallible> {
+            Ok(())
         }
-
-        async fn execute(self, _storage: &MemoryStorage<SimpleJob>) {}
     }
 
     #[tokio::test]
@@ -298,7 +275,7 @@ mod tests {
             poll_interval: Duration::from_millis(100),
         };
 
-        let result = JobQueue::new::<SimpleJob, _>(storage, config);
+        let result = JobQueue::new(storage, config);
         match result {
             Err(e) => assert!(e.to_string().contains("workers must be greater than 0")),
             Ok(_) => panic!("Expected error for zero workers"),
@@ -313,7 +290,7 @@ mod tests {
             poll_interval: Duration::from_millis(0),
         };
 
-        let result = JobQueue::new::<SimpleJob, _>(storage, config);
+        let result = JobQueue::new(storage, config);
         match result {
             Err(e) => assert!(
                 e.to_string()
@@ -327,7 +304,6 @@ mod tests {
     // JobQueue Behavior Tests
     // =========================================================================
 
-    // Storage wrapper that includes a counter for tracking executed jobs
     #[derive(Clone)]
     struct CountingStorage {
         jobs: MemoryStorage<u64>,
@@ -342,10 +318,6 @@ mod tests {
             }
         }
 
-        async fn push(&self, job: u64) {
-            self.jobs.push(job).await;
-        }
-
         fn count(&self) -> usize {
             self.executed.load(Ordering::SeqCst)
         }
@@ -355,7 +327,6 @@ mod tests {
         }
     }
 
-    // Job type that increments counter on execute
     struct CountingJob {
         _id: u64,
         counter: Arc<AtomicUsize>,
@@ -364,29 +335,56 @@ mod tests {
     impl Job<CountingStorage> for CountingJob {
         type Error = Infallible;
 
-        async fn fetch_and_claim(storage: &CountingStorage) -> Result<Option<Self>, Infallible> {
-            Ok(storage.jobs.pop().await.map(|id| CountingJob {
-                _id: id,
-                counter: storage.executed.clone(),
-            }))
+        async fn execute(self, _storage: &CountingStorage) -> Result<(), Infallible> {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl Storage for CountingStorage {
+        type Job = CountingJob;
+        type Error = Infallible;
+
+        async fn push(&self, _job: Self::Job) -> Result<(), Self::Error> {
+            // Not used in these tests
+            Ok(())
         }
 
-        async fn execute(self, _storage: &CountingStorage) {
-            self.counter.fetch_add(1, Ordering::SeqCst);
+        async fn pop(&self) -> Result<Option<Self::Job>, Self::Error> {
+            Ok(self.jobs.pop().await.ok().flatten().map(|id| CountingJob {
+                _id: id,
+                counter: self.executed.clone(),
+            }))
+        }
+    }
+
+    // Helper to push raw job IDs to CountingStorage
+    impl CountingStorage {
+        async fn push_id(&self, id: u64) {
+            self.jobs.push(id).await.unwrap();
+        }
+    }
+
+    // Need a simple impl of Job for u64 so MemoryStorage<u64> works
+    impl Job<MemoryStorage<u64>> for u64 {
+        type Error = Infallible;
+
+        async fn execute(self, _storage: &MemoryStorage<u64>) -> Result<(), Infallible> {
+            Ok(())
         }
     }
 
     #[tokio::test]
     async fn processes_single_job() {
         let storage = CountingStorage::new();
-        storage.push(1).await;
+        storage.push_id(1).await;
 
         let config = JobQueueConfig {
             workers: 1,
             poll_interval: Duration::from_millis(10),
         };
 
-        let queue = JobQueue::new::<CountingJob, _>(storage.clone(), config).unwrap();
+        let queue = JobQueue::new(storage.clone(), config).unwrap();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -400,7 +398,7 @@ mod tests {
     async fn processes_multiple_jobs() {
         let storage = CountingStorage::new();
         for i in 0..5 {
-            storage.push(i).await;
+            storage.push_id(i).await;
         }
 
         let config = JobQueueConfig {
@@ -408,7 +406,7 @@ mod tests {
             poll_interval: Duration::from_millis(10),
         };
 
-        let queue = JobQueue::new::<CountingJob, _>(storage.clone(), config).unwrap();
+        let queue = JobQueue::new(storage.clone(), config).unwrap();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -427,7 +425,7 @@ mod tests {
             poll_interval: Duration::from_millis(10),
         };
 
-        let queue = JobQueue::new::<SimpleJob, _>(storage, config).unwrap();
+        let queue = JobQueue::new(storage, config).unwrap();
 
         let result = queue.shutdown().await;
         assert!(result.is_ok());
@@ -442,7 +440,7 @@ mod tests {
             poll_interval: Duration::from_millis(50),
         };
 
-        let queue = JobQueue::new::<SimpleJob, _>(storage, config).unwrap();
+        let queue = JobQueue::new(storage, config).unwrap();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
