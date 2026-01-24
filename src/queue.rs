@@ -1,14 +1,12 @@
 //! Job queue implementation with configurable workers.
 
+use crate::{Job, Storage};
 use std::sync::Arc;
 use std::time::Duration;
-
 use thiserror::Error;
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
 use tracing::{debug, error};
-
-use crate::{Job, Storage};
 
 /// Errors that can occur when using the job queue.
 #[derive(Debug, Error)]
@@ -78,15 +76,20 @@ impl Default for JobQueueConfig {
 /// use fast_job_queue::{JobQueue, JobQueueConfig, MemoryStorage};
 ///
 /// let storage = MemoryStorage::new();
-/// let queue = JobQueue::new(storage, JobQueueConfig::default())?;
+/// let queue = JobQueue::new(JobQueueConfig::default(), storage)?;
 ///
 /// // Queue processes jobs in the background...
 ///
 /// queue.shutdown().await?;
 /// ```
+#[derive(Clone)]
 pub struct JobQueue<S: Storage> {
+    inner: Arc<JobQueueInner<S>>,
+}
+
+struct JobQueueInner<S: Storage> {
     storage: S,
-    workers: Vec<JoinHandle<()>>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
     shutdown_tx: broadcast::Sender<()>,
 }
 
@@ -101,7 +104,7 @@ impl<S: Storage> JobQueue<S> {
     /// - `workers` is 0
     /// - `poll_interval` is 0
     #[must_use = "job queue must be stored to keep workers running"]
-    pub fn new(storage: S, config: JobQueueConfig) -> Result<Self, JobQueueError> {
+    pub fn new(config: JobQueueConfig, storage: S) -> Result<Self, JobQueueError> {
         if config.workers == 0 {
             return Err(JobQueueError::InvalidConfig(
                 "workers must be greater than 0".into(),
@@ -173,25 +176,28 @@ impl<S: Storage> JobQueue<S> {
         }
 
         Ok(Self {
-            storage,
-            workers,
-            shutdown_tx,
+            inner: Arc::new(JobQueueInner {
+                storage,
+                workers: Mutex::new(workers),
+                shutdown_tx,
+            }),
         })
     }
 
     /// Get a reference to the storage backend.
     pub fn storage(&self) -> &S {
-        &self.storage
+        &self.inner.storage
     }
 
     /// Gracefully shutdown the queue.
     ///
     /// This signals all workers to stop and waits for them to finish processing
     /// their current jobs.
-    pub async fn shutdown(self) -> Result<(), JobQueueError> {
-        let _ = self.shutdown_tx.send(());
+    pub async fn shutdown(&self) -> Result<(), JobQueueError> {
+        let _ = self.inner.shutdown_tx.send(());
+        let mut workers = self.inner.workers.lock().await;
 
-        for (idx, handle) in self.workers.into_iter().enumerate() {
+        for (idx, handle) in workers.drain(..).enumerate() {
             handle.await.map_err(|e| {
                 JobQueueError::WorkerPanicked(format!("Worker {} panicked: {}", idx, e))
             })?;
@@ -199,23 +205,6 @@ impl<S: Storage> JobQueue<S> {
 
         tracing::info!("All workers shut down successfully");
         Ok(())
-    }
-
-    /// Attempt to shutdown an `Arc<JobQueue>` if it's the last reference.
-    pub async fn shutdown_arc(self: Arc<Self>) {
-        tracing::info!("Shutting down job queue...");
-        match Arc::try_unwrap(self) {
-            Ok(queue) => {
-                if let Err(e) = queue.shutdown().await {
-                    tracing::error!("Error shutting down job queue: {:?}", e);
-                } else {
-                    tracing::info!("Job queue shut down successfully");
-                }
-            }
-            Err(_) => {
-                tracing::warn!("Could not shutdown job queue - still has active references");
-            }
-        }
     }
 }
 
@@ -275,7 +264,7 @@ mod tests {
             poll_interval: Duration::from_millis(100),
         };
 
-        let result = JobQueue::new(storage, config);
+        let result = JobQueue::new(config, storage);
         match result {
             Err(e) => assert!(e.to_string().contains("workers must be greater than 0")),
             Ok(_) => panic!("Expected error for zero workers"),
@@ -290,7 +279,7 @@ mod tests {
             poll_interval: Duration::from_millis(0),
         };
 
-        let result = JobQueue::new(storage, config);
+        let result = JobQueue::new(config, storage);
         match result {
             Err(e) => assert!(
                 e.to_string()
@@ -384,7 +373,7 @@ mod tests {
             poll_interval: Duration::from_millis(10),
         };
 
-        let queue = JobQueue::new(storage.clone(), config).unwrap();
+        let queue = JobQueue::new(config, storage.clone()).unwrap();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -406,7 +395,7 @@ mod tests {
             poll_interval: Duration::from_millis(10),
         };
 
-        let queue = JobQueue::new(storage.clone(), config).unwrap();
+        let queue = JobQueue::new(config, storage.clone()).unwrap();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -425,7 +414,7 @@ mod tests {
             poll_interval: Duration::from_millis(10),
         };
 
-        let queue = JobQueue::new(storage, config).unwrap();
+        let queue = JobQueue::new(config, storage).unwrap();
 
         let result = queue.shutdown().await;
         assert!(result.is_ok());
@@ -440,10 +429,29 @@ mod tests {
             poll_interval: Duration::from_millis(50),
         };
 
-        let queue = JobQueue::new(storage, config).unwrap();
+        let queue = JobQueue::new(config, storage).unwrap();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         queue.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_clone_shares_state() {
+        let storage: MemoryStorage<SimpleJob> = MemoryStorage::new();
+        let config = JobQueueConfig {
+            workers: 1,
+            poll_interval: Duration::from_millis(10),
+        };
+
+        let queue1 = JobQueue::new(config, storage).unwrap();
+        let queue2 = queue1.clone();
+
+        // Shutdown through one handle should stop workers for both
+        queue1.shutdown().await.unwrap();
+
+        // Second shutdown should complete immediately (workers already stopped)
+        // or just return ok
+        queue2.shutdown().await.unwrap();
     }
 }

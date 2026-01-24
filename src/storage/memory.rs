@@ -95,7 +95,6 @@ impl<J: Job<Self> + Send + Sync + 'static> super::Storage for MemoryStorage<J> {
 mod tests {
     use super::*;
     use crate::Storage;
-    use std::convert::Infallible;
 
     // Simple job for testing
     #[derive(Debug, PartialEq)]
