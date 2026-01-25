@@ -36,7 +36,7 @@
 //!
 //! // Create storage and queue
 //! let storage = MemoryStorage::new();
-//! let queue = JobQueue::new(storage.clone(), JobQueueConfig::default())?;
+//! let queue = JobQueue::new(JobQueueConfig::default(), storage.clone())?;
 //!
 //! // Push jobs through storage
 //! storage.push(MyJob { id: 1, data: "task".into() }).await?;

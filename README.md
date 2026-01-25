@@ -30,7 +30,7 @@ impl Job<MemoryStorage<EmailJob>> for EmailJob {
 #[tokio::main]
 async fn main() {
     let storage = MemoryStorage::new();
-    let queue = JobQueue::new(storage.clone(), JobQueueConfig::default()).unwrap();
+    let queue = JobQueue::new(JobQueueConfig::default(), storage.clone()).unwrap();
 
     // Push jobs through storage
     storage.push(EmailJob { to: "user@example.com".into(), body: "Hello!".into() }).await.unwrap();
