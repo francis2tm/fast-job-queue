@@ -155,8 +155,24 @@ impl<S: Storage> JobQueue<S> {
                             }
                         }
                         Ok(None) => {
-                            // No jobs available, wait before polling again
-                            tokio::time::sleep(config.poll_interval).await;
+                            // No jobs available, wait for jobs OR shutdown signal
+                            tokio::select! {
+                                res = storage.wait_for_job(config.poll_interval) => {
+                                    if let Err(e) = res {
+                                        error!(
+                                            worker_id = worker_id,
+                                            error = %e,
+                                            "Failed to wait for job"
+                                        );
+                                        // Fallback to sleep if waiting fails
+                                        tokio::time::sleep(config.poll_interval).await;
+                                    }
+                                }
+                                _ = shutdown_rx.recv() => {
+                                    debug!(worker_id = worker_id, "Worker received shutdown signal while waiting");
+                                    break;
+                                }
+                            }
                         }
                         Err(e) => {
                             error!(
@@ -453,5 +469,125 @@ mod tests {
         // Second shutdown should complete immediately (workers already stopped)
         // or just return ok
         queue2.shutdown().await.unwrap();
+    }
+
+    struct NotifyJob {
+        notify: Arc<tokio::sync::Notify>,
+    }
+
+    impl Job<MemoryStorage<NotifyJob>> for NotifyJob {
+        type Error = Infallible;
+        async fn execute(self, _storage: &MemoryStorage<NotifyJob>) -> Result<(), Infallible> {
+            self.notify.notify_one();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn job_queue_wait_for_job_processes_instantly() {
+        let storage: MemoryStorage<NotifyJob> = MemoryStorage::new();
+        let notify = Arc::new(tokio::sync::Notify::new());
+
+        let config = JobQueueConfig {
+            workers: 1,
+            // Long poll interval - if it didn't wake up instantly, it would take 5s
+            poll_interval: Duration::from_secs(5),
+        };
+
+        let queue = JobQueue::new(config, storage.clone()).unwrap();
+
+        // Wait for worker to start waiting
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        storage
+            .push(NotifyJob {
+                notify: notify.clone(),
+            })
+            .await
+            .unwrap();
+
+        // Wait for job to be executed
+        // If it polls (5s), this will timeout
+        let result = tokio::time::timeout(Duration::from_millis(200), notify.notified()).await;
+        assert!(result.is_ok(), "Job should be processed instantly");
+
+        queue.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_queue_wait_for_job_respects_polling_wait() {
+        // CountingStorage uses the DEFAULT wait_for_job (which sleeps)
+        let storage = CountingStorage::new();
+
+        let config = JobQueueConfig {
+            workers: 1,
+            poll_interval: Duration::from_millis(500),
+        };
+
+        let queue = JobQueue::new(config, storage.clone()).unwrap();
+
+        // Wait for worker to start and enter sleep (poll interval)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Push job "sideways" directly to inner memory storage
+        // Since CountingStorage doesn't forward wait_for_job/push notifications properly (it uses default sleep),
+        // the worker is currently sleeping for 500ms.
+        storage.push_id(1).await;
+
+        // Check immediate status - should NOT be processed yet (worker is sleeping)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            storage.count(),
+            0,
+            "Job processed too early! Worker didn't respect poll interval sleep"
+        );
+
+        // Wait enough time for poll interval to expire
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            storage.count(),
+            1,
+            "Job should have been processed after poll interval"
+        );
+
+        queue.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_queue_wait_for_job_shutdown_responsiveness() {
+        // Use CountingStorage which sleeps for poll_interval
+        let storage = CountingStorage::new();
+
+        // Use a LONG poll interval to easily detect if shutdown waits for it
+        let poll_interval = Duration::from_secs(5);
+        let config = JobQueueConfig {
+            workers: 1,
+            poll_interval,
+        };
+
+        let queue = JobQueue::new(config, storage.clone()).unwrap();
+
+        // Use a background task to call shutdown, so we can measure how long it takes
+        let queue_clone = queue.clone();
+        let start = std::time::Instant::now();
+
+        // Give worker time to start and enter sleep
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Call shutdown.
+        // IDEALLY: It should return instantly (interrupting the sleep).
+        // CURRENTLY EXPECTED: It might wait for 5s (poll_interval).
+        // This test documents the behavior.
+        queue_clone.shutdown().await.unwrap();
+
+        let elapsed = start.elapsed();
+
+        // If it takes > 4s, it means it waited for the full poll interval
+        // Ideally we want elapsed < 1s
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "Shutdown took too long: {:?}",
+            elapsed
+        );
     }
 }

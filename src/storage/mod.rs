@@ -57,4 +57,20 @@ pub trait Storage: Clone + Send + Sync + 'static {
     ///
     /// Returns `Ok(None)` if no pending jobs are available.
     fn pop(&self) -> impl Future<Output = Result<Option<Self::Job>, Self::Error>> + Send;
+
+    /// Wait for a job to become available or for the timeout to expire.
+    ///
+    /// This allows storage backends to implement event-driven notifications (push)
+    /// instead of blind polling.
+    ///
+    /// The default implementation simply sleeps for `timeout`.
+    fn wait_for_job(
+        &self,
+        timeout: std::time::Duration,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async move {
+            tokio::time::sleep(timeout).await;
+            Ok(())
+        }
+    }
 }

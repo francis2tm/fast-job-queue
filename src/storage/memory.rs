@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::Job;
 
@@ -35,12 +35,14 @@ use crate::Job;
 /// ```
 pub struct MemoryStorage<J> {
     jobs: Arc<Mutex<VecDeque<J>>>,
+    notify: Arc<Notify>,
 }
 
 impl<J> Clone for MemoryStorage<J> {
     fn clone(&self) -> Self {
         Self {
             jobs: Arc::clone(&self.jobs),
+            notify: Arc::clone(&self.notify),
         }
     }
 }
@@ -57,6 +59,7 @@ impl<J> MemoryStorage<J> {
     pub fn new() -> Self {
         Self {
             jobs: Arc::new(Mutex::new(VecDeque::new())),
+            notify: Arc::new(Notify::new()),
         }
     }
 
@@ -79,11 +82,19 @@ impl<J: Job<Self> + Send + Sync + 'static> super::Storage for MemoryStorage<J> {
 
     async fn push(&self, job: Self::Job) -> Result<(), Self::Error> {
         self.jobs.lock().await.push_back(job);
+        self.notify.notify_one();
         Ok(())
     }
 
     async fn pop(&self) -> Result<Option<Self::Job>, Self::Error> {
         Ok(self.jobs.lock().await.pop_front())
+    }
+
+    async fn wait_for_job(&self, timeout: std::time::Duration) -> Result<(), Self::Error> {
+        // Wait for notification OR timeout
+        // If we timeout, it just means we loop around and check again (which is fine)
+        let _ = tokio::time::timeout(timeout, self.notify.notified()).await;
+        Ok(())
     }
 }
 
@@ -189,5 +200,79 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 100);
+    }
+
+    #[tokio::test]
+    async fn wait_for_job_wakes_immediately() {
+        let storage: MemoryStorage<TestJob> = MemoryStorage::new();
+        let storage_clone = storage.clone();
+
+        let start = std::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            // Wait with a long timeout
+            storage_clone
+                .wait_for_job(std::time::Duration::from_secs(5))
+                .await
+                .unwrap();
+        });
+
+        // Small delay to ensure the other task is waiting
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Push should wake it up immediately
+        storage.push(TestJob { id: 1 }).await.unwrap();
+
+        handle.await.unwrap();
+        let elapsed = start.elapsed();
+
+        // Should happen almost instantly, definitely much faster than the 5s timeout
+        assert!(elapsed < std::time::Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn wait_for_job_respects_timeout() {
+        let storage: MemoryStorage<TestJob> = MemoryStorage::new();
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(100);
+
+        // This should timeout because nothing is pushed
+        storage.wait_for_job(timeout).await.unwrap();
+
+        let elapsed = start.elapsed();
+        // Should wait at least the timeout duration
+        assert!(elapsed >= timeout);
+    }
+
+    #[tokio::test]
+    async fn wait_for_job_only_wakes_one() {
+        let storage: MemoryStorage<TestJob> = MemoryStorage::new();
+        let counter = Arc::new(tokio::sync::Mutex::new(0));
+
+        // Spawn 3 waiting tasks
+        for _ in 0..3 {
+            let storage = storage.clone();
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                storage
+                    .wait_for_job(std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap();
+                let mut c = counter.lock().await;
+                *c += 1;
+            });
+        }
+
+        // Give them time to start waiting
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Push ONE job, should wake ONE task
+        storage.push(TestJob { id: 1 }).await.unwrap();
+
+        // Give it time to wake up
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let count = *counter.lock().await;
+        assert_eq!(count, 1);
     }
 }
