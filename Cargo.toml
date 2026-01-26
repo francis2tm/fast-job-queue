@@ -11,7 +11,7 @@ categories = ["asynchronous", "concurrency"]
 readme = "README.md"
 
 [features]
-default = ["postgres"]
+default = []
 postgres = ["dep:diesel", "dep:diesel-async"]
 
 [dependencies]

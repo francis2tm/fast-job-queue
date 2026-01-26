@@ -102,13 +102,13 @@ src/
 
 | Feature    | Default | Description                      |
 | ---------- | ------- | -------------------------------- |
-| `postgres` | ✓       | Enables `impl_diesel_pop!` macro |
+| `postgres` |         | Enables `impl_diesel_pop!` macro |
 
-To use without postgres:
+To use with postgres:
 
 ```toml
 [dependencies]
-fast-job-queue = { version = "0.1", default-features = false }
+fast-job-queue = { version = "0.1", features = ["postgres"] }
 ```
 
 ## Configuration
@@ -125,7 +125,3 @@ let config = JobQueueConfig {
 // Or use defaults (4 workers, 1s poll interval)
 let config = JobQueueConfig::default();
 ```
-
-## License
-
-Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE) or http://www.apache.org/licenses/LICENSE-2.0).
