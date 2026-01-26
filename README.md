@@ -13,7 +13,7 @@ A storage-agnostic async job queue with configurable workers for Rust.
 ## Quick Start
 
 ```rust
-use fast_job_queue::{Job, JobQueue, JobQueueConfig, MemoryStorage};
+use fast_job_queue::{Job, JobQueue, JobQueueConfig, MemoryStorage, Storage};
 use std::convert::Infallible;
 
 struct EmailJob { to: String, body: String }
@@ -21,21 +21,19 @@ struct EmailJob { to: String, body: String }
 impl Job<MemoryStorage<EmailJob>> for EmailJob {
     type Error = Infallible;
 
-    async fn fetch_and_claim(storage: &MemoryStorage<EmailJob>) -> Result<Option<Self>, Infallible> {
-        Ok(storage.pop().await)
-    }
-
-    async fn execute(self, _storage: &MemoryStorage<EmailJob>) {
+    async fn execute(self, _storage: &MemoryStorage<EmailJob>) -> Result<(), Infallible> {
         println!("Sending email to {}", self.to);
+        Ok(())
     }
 }
 
 #[tokio::main]
 async fn main() {
     let storage = MemoryStorage::new();
-    storage.push(EmailJob { to: "user@example.com".into(), body: "Hello!".into() }).await;
+    let queue = JobQueue::new(JobQueueConfig::default(), storage.clone()).unwrap();
 
-    let queue = JobQueue::new::<EmailJob, _>(storage, JobQueueConfig::default()).unwrap();
+    // Push jobs through storage
+    storage.push(EmailJob { to: "user@example.com".into(), body: "Hello!".into() }).await.unwrap();
 
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
@@ -46,28 +44,43 @@ async fn main() {
 ## With Postgres
 
 ```rust,ignore
-use fast_job_queue::{impl_diesel_fetch_and_claim, Job, JobQueue, JobQueueConfig};
+use fast_job_queue::{impl_diesel_pop, Job, JobQueue, JobQueueConfig, Storage};
+use std::convert::Infallible;
 
-impl Job<MyDbPool> for MyJob {
+// Your storage wraps a database pool
+#[derive(Clone)]
+struct MyStorage { pool: MyDbPool }
+
+impl Storage for MyStorage {
+    type Job = MyJob;
     type Error = MyDbError;
 
-    async fn fetch_and_claim(pool: &MyDbPool) -> Result<Option<Self>, MyDbError> {
-        impl_diesel_fetch_and_claim!(
-            pool: pool,
-            get_connection: get_connection,
-            table: schema::jobs::table,
-            id_column: schema::jobs::id,
-            status_column: schema::jobs::status,
-            pending_status: "pending",
-            running_status: "running",
-            model: MyJob,
-            id_type: Uuid,
-            error_type: MyDbError
-        )
+    async fn push(&self, _job: Self::Job) -> Result<(), Self::Error> {
+        // Insert job into database or unimplemented if using API handlers
+        unimplemented!("Use API handlers to insert jobs")
     }
 
-    async fn execute(self, pool: &MyDbPool) {
+    async fn pop(&self) -> Result<Option<Self::Job>, Self::Error> {
+        impl_diesel_pop!(
+            self.pool,
+            get_connection,
+            schema::jobs::table,
+            schema::jobs::id,
+            schema::jobs::status,
+            JobStatus::Pending => JobStatus::Running,
+            MyJob,
+            Uuid,
+            MyDbError
+        )
+    }
+}
+
+impl Job<MyStorage> for MyJob {
+    type Error = Infallible;
+
+    async fn execute(self, storage: &MyStorage) -> Result<(), Infallible> {
         // Process job, update status to completed/failed
+        Ok(())
     }
 }
 ```
@@ -77,19 +90,19 @@ impl Job<MyDbPool> for MyJob {
 ```
 src/
 ├── lib.rs          # Re-exports
-├── job.rs          # Job trait (with Error associated type)
-├── queue.rs        # JobQueue, JobQueueConfig, JobQueueError
+├── job.rs          # Job<S> trait
+├── queue.rs        # JobQueue<S>, JobQueueConfig, JobQueueError
 └── storage/
-    ├── mod.rs      # MemoryStorage re-export
+    ├── mod.rs      # Storage trait, MemoryStorage re-export
     ├── memory.rs   # MemoryStorage (in-memory)
-    └── postgres.rs # fetch_and_claim macro
+    └── postgres.rs # impl_diesel_pop! macro
 ```
 
 ## Feature Flags
 
-| Feature    | Default | Description                                  |
-| ---------- | ------- | -------------------------------------------- |
-| `postgres` | ✓       | Enables `impl_diesel_fetch_and_claim!` macro |
+| Feature    | Default | Description                      |
+| ---------- | ------- | -------------------------------- |
+| `postgres` | ✓       | Enables `impl_diesel_pop!` macro |
 
 To use without postgres:
 

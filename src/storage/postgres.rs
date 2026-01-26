@@ -1,12 +1,9 @@
 //! Postgres storage backend via diesel.
 //!
-//! This module provides the [`impl_diesel_fetch_and_claim!`] macro for
-//! implementing [`Job::fetch_and_claim`] with diesel models.
-//!
-//! The macro is designed to be storage-agnostic - you provide your own pool
-//! type, connection getter, and error type.
+//! This module provides the [`impl_diesel_pop!`] macro for
+//! implementing [`Storage::pop`] with diesel models.
 
-/// Implement the `fetch_and_claim` method for diesel models.
+/// Implement the `pop` method for diesel-backed Storage implementations.
 ///
 /// This implements the common pattern of:
 /// 1. `SELECT id FROM table WHERE status = pending LIMIT 1 FOR UPDATE SKIP LOCKED`
@@ -15,76 +12,58 @@
 ///
 /// All operations are performed within a single database transaction to ensure atomicity.
 ///
-/// # Arguments
+/// # Arguments (positional)
 ///
-/// - `pool` - Expression yielding the pool reference
-/// - `get_connection` - Method name to get an async connection from the pool (e.g., `get_service_connection`)
-/// - `table` - The diesel table (e.g., `schema::jobs::table`)
-/// - `id_column` - The ID column (e.g., `schema::jobs::id`)
-/// - `status_column` - The status column (e.g., `schema::jobs::status`)
-/// - `pending_status` - Value indicating a pending job
-/// - `running_status` - Value indicating a running job
-/// - `model` - The model type to return
-/// - `id_type` - The ID column's Rust type (e.g., `Uuid`)
-/// - `error_type` - The error type for Result (must implement `From<diesel::result::Error>`)
+/// 1. `pool` - Expression yielding the pool reference
+/// 2. `get_connection` - Method name to get an async connection from the pool
+/// 3. `table` - The diesel table (e.g., `schema::jobs::table`)
+/// 4. `id_column` - The ID column (e.g., `schema::jobs::id`)
+/// 5. `status_column` - The status column (e.g., `schema::jobs::status`)
+/// 6. `pending => running` - Status transition (pending_status => running_status)
+/// 7. `model` - The model type to return
+/// 8. `id_type` - The ID column's Rust type (e.g., `Uuid`)
+/// 9. `error_type` - The error type for Result (must implement `From<diesel::result::Error>`)
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// use diesel::{Queryable, Selectable};
-/// use fast_job_queue::{impl_diesel_fetch_and_claim, Job};
-/// use uuid::Uuid;
+/// use fast_job_queue::{impl_diesel_pop, Storage};
 ///
-/// diesel::table! {
-///     jobs (id) {
-///         id -> Uuid,
-///         status -> Int4,
+/// impl Storage for MyStorage {
+///     type Job = MyJob;
+///     type Error = MyDbError;
+///
+///     async fn push(&self, _job: Self::Job) -> Result<(), Self::Error> {
+///         unimplemented!("Use API to insert jobs")
 ///     }
-/// }
 ///
-/// #[derive(Selectable, Queryable)]
-/// #[diesel(table_name = jobs, check_for_backend(diesel::pg::Pg))]
-/// struct MyJob {
-///     id: Uuid,
-///     status: i32,
-/// }
-///
-/// impl Job<MyPool> for MyJob {
-///     type Error = MyError;
-///
-///     async fn fetch_and_claim(pool: &MyPool) -> Result<Option<Self>, Self::Error> {
-///         impl_diesel_fetch_and_claim!(
-///             pool: pool,
-///             get_connection: get_service_connection,
-///             table: jobs::table,
-///             id_column: jobs::id,
-///             status_column: jobs::status,
-///             pending_status: 0,
-///             running_status: 1,
-///             model: MyJob,
-///             id_type: Uuid,
-///             error_type: MyError
+///     async fn pop(&self) -> Result<Option<Self::Job>, Self::Error> {
+///         impl_diesel_pop!(
+///             self.db_pool,
+///             get_service_connection,
+///             schema::jobs::table,
+///             schema::jobs::id,
+///             schema::jobs::status,
+///             JobStatus::Pending => JobStatus::Running,
+///             MyJob,
+///             Uuid,
+///             MyDbError
 ///         )
-///     }
-///
-///     async fn execute(self, _pool: &MyPool) {
-///         // Process the job...
 ///     }
 /// }
 /// ```
 #[macro_export]
-macro_rules! impl_diesel_fetch_and_claim {
+macro_rules! impl_diesel_pop {
     (
-        pool: $pool:expr,
-        get_connection: $get_conn:ident,
-        table: $table:expr,
-        id_column: $id_column:expr,
-        status_column: $status_column:expr,
-        pending_status: $pending_status:expr,
-        running_status: $running_status:expr,
-        model: $model:ty,
-        id_type: $id_type:ty,
-        error_type: $error_type:ty
+        $pool:expr,
+        $get_conn:ident,
+        $table:expr,
+        $id_column:expr,
+        $status_column:expr,
+        $pending_status:expr => $running_status:expr,
+        $model:ty,
+        $id_type:ty,
+        $error_type:ty
     ) => {{
         use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper, update};
         use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
