@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 
-use crate::Job;
+use crate::{Job, Storage};
 
 /// In-memory job storage.
 ///
@@ -76,7 +76,7 @@ impl<J> MemoryStorage<J> {
     }
 }
 
-impl<J: Job<Self> + Send + Sync + 'static> super::Storage for MemoryStorage<J> {
+impl<J: Job<Self> + Send + Sync + 'static> Storage for MemoryStorage<J> {
     type Job = J;
     type Error = Infallible;
 

@@ -119,7 +119,7 @@ use fast_job_queue::JobQueueConfig;
 
 let config = JobQueueConfig {
     workers: 8,                              // Number of concurrent workers
-    poll_interval: Duration::from_millis(100), // Polling frequency when idle
+    timeout: Duration::from_millis(100), // Polling frequency when idle
 };
 
 // Or use defaults (4 workers, 1s poll interval)
