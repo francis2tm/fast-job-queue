@@ -121,6 +121,10 @@ mod tests {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // storage_* tests
+    // -------------------------------------------------------------------------
+
     #[tokio::test]
     async fn storage_new_is_empty() {
         let storage: MemoryStorage<TestJob> = MemoryStorage::new();
@@ -203,6 +207,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn storage_concurrent_push_pop() {
+        let storage: MemoryStorage<TestJob> = MemoryStorage::new();
+
+        let producer = {
+            let storage = storage.clone();
+            tokio::spawn(async move {
+                for i in 0..100 {
+                    storage.push(TestJob { id: i }).await.unwrap();
+                }
+            })
+        };
+
+        let consumer = {
+            let storage = storage.clone();
+            tokio::spawn(async move {
+                let mut popped = 0;
+                while popped < 100 {
+                    if storage.pop().await.unwrap().is_some() {
+                        popped += 1;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                popped
+            })
+        };
+
+        producer.await.unwrap();
+        assert_eq!(consumer.await.unwrap(), 100);
+        assert!(storage.is_empty().await);
+    }
+
+    // -------------------------------------------------------------------------
+    // wait_for_job_* tests
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
     async fn wait_for_job_wakes_immediately() {
         let storage: MemoryStorage<TestJob> = MemoryStorage::new();
         let storage_clone = storage.clone();
@@ -274,5 +314,70 @@ mod tests {
 
         let count = *counter.lock().await;
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn wait_for_job_consecutive_timeouts() {
+        let storage: MemoryStorage<TestJob> = MemoryStorage::new();
+        let timeout = std::time::Duration::from_millis(50);
+
+        let start = std::time::Instant::now();
+
+        // Both should timeout without issue
+        storage.wait_for_job(timeout).await.unwrap();
+        storage.wait_for_job(timeout).await.unwrap();
+
+        // Should have waited at least 2x timeout
+        assert!(start.elapsed() >= timeout * 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // job_execute_* tests
+    // -------------------------------------------------------------------------
+
+    // Job that can spawn a sub-job during execution
+    #[derive(Debug, PartialEq)]
+    struct SpawningJob {
+        id: u64,
+        spawn_child: bool,
+    }
+
+    impl Job<MemoryStorage<SpawningJob>> for SpawningJob {
+        type Error = Infallible;
+
+        async fn execute(self, storage: &MemoryStorage<SpawningJob>) -> Result<(), Self::Error> {
+            if self.spawn_child {
+                storage
+                    .push(SpawningJob {
+                        id: self.id + 100,
+                        spawn_child: false,
+                    })
+                    .await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn job_execute_can_spawn_new_jobs() {
+        let storage: MemoryStorage<SpawningJob> = MemoryStorage::new();
+
+        // Parent job that will spawn a child
+        let parent = SpawningJob {
+            id: 1,
+            spawn_child: true,
+        };
+        storage.push(parent).await.unwrap();
+
+        // Pop and execute the parent
+        let job = storage.pop().await.unwrap().unwrap();
+        assert_eq!(job.id, 1);
+        job.execute(&storage).await.unwrap();
+
+        // Child job should now be in the queue
+        assert_eq!(storage.len().await, 1);
+        let child = storage.pop().await.unwrap().unwrap();
+        assert_eq!(child.id, 101);
+        assert!(!child.spawn_child);
     }
 }
