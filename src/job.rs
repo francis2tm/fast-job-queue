@@ -29,7 +29,7 @@ use std::future::Future;
 /// ```
 pub trait Job<S>
 where
-    S: Sized + Send + Sync,
+    S: Send + Sync,
 {
     /// Error type for execute operations.
     ///

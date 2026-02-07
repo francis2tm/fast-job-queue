@@ -34,7 +34,7 @@ pub enum JobQueueError {
 /// // Or customize
 /// let config = JobQueueConfig {
 ///     workers: 8,
-///     timeout: Duration::from_millis(100),
+///     poll_interval: Duration::from_millis(100),
 /// };
 /// ```
 #[derive(Clone, Debug)]
@@ -43,14 +43,14 @@ pub struct JobQueueConfig {
     pub workers: usize,
 
     /// How long to wait between polls when no jobs are available.
-    pub timeout: Duration,
+    pub poll_interval: Duration,
 }
 
 impl Default for JobQueueConfig {
     fn default() -> Self {
         Self {
             workers: 4,
-            timeout: Duration::from_secs(1),
+            poll_interval: Duration::from_secs(1),
         }
     }
 }
@@ -111,9 +111,9 @@ impl<S: Storage> JobQueue<S> {
             ));
         }
 
-        if config.timeout == Duration::from_millis(0) {
+        if config.poll_interval == Duration::from_millis(0) {
             return Err(JobQueueError::InvalidConfig(
-                "timeout must be greater than 0".into(),
+                "poll_interval must be greater than 0".into(),
             ));
         }
 
@@ -158,7 +158,7 @@ impl<S: Storage> JobQueue<S> {
                         Ok(None) => {
                             // No jobs available, wait for jobs OR shutdown signal
                             tokio::select! {
-                                res = storage.wait_for_job(config.timeout) => {
+                                res = storage.wait_for_job(config.poll_interval) => {
                                     if let Err(e) = res {
                                         error!(
                                             worker_id = worker_id,
@@ -166,7 +166,7 @@ impl<S: Storage> JobQueue<S> {
                                             "Failed to wait for job"
                                         );
                                         // Fallback to sleep if waiting fails
-                                        tokio::time::sleep(config.timeout).await;
+                                        tokio::time::sleep(config.poll_interval).await;
                                     }
                                 }
                                 _ = shutdown_rx.recv() => {
@@ -181,7 +181,7 @@ impl<S: Storage> JobQueue<S> {
                                 error = %e,
                                 "Failed to pop job from storage"
                             );
-                            tokio::time::sleep(config.timeout).await;
+                            tokio::time::sleep(config.poll_interval).await;
                         }
                     }
                 }
@@ -244,18 +244,18 @@ mod tests {
     fn config_default_has_sensible_values() {
         let config = JobQueueConfig::default();
         assert_eq!(config.workers, 4);
-        assert_eq!(config.timeout, Duration::from_secs(1));
+        assert_eq!(config.poll_interval, Duration::from_secs(1));
     }
 
     #[test]
     fn config_clone_works() {
         let config = JobQueueConfig {
             workers: 10,
-            timeout: Duration::from_millis(500),
+            poll_interval: Duration::from_millis(500),
         };
         let cloned = config.clone();
         assert_eq!(cloned.workers, 10);
-        assert_eq!(cloned.timeout, Duration::from_millis(500));
+        assert_eq!(cloned.poll_interval, Duration::from_millis(500));
     }
 
     // =========================================================================
@@ -278,7 +278,7 @@ mod tests {
         let storage: MemoryStorage<SimpleJob> = MemoryStorage::new();
         let config = JobQueueConfig {
             workers: 0,
-            timeout: Duration::from_millis(100),
+            poll_interval: Duration::from_millis(100),
         };
 
         let result = JobQueue::new(config, storage);
@@ -289,17 +289,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_rejects_zero_timeout() {
+    async fn new_rejects_zero_poll_interval() {
         let storage: MemoryStorage<SimpleJob> = MemoryStorage::new();
         let config = JobQueueConfig {
             workers: 2,
-            timeout: Duration::from_millis(0),
+            poll_interval: Duration::from_millis(0),
         };
 
         let result = JobQueue::new(config, storage);
         match result {
-            Err(e) => assert!(e.to_string().contains("timeout must be greater than 0")),
-            Ok(_) => panic!("Expected error for zero timeout"),
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("poll_interval must be greater than 0")
+            ),
+            Ok(_) => panic!("Expected error for zero poll_interval"),
         }
     }
 
@@ -384,7 +387,7 @@ mod tests {
 
         let config = JobQueueConfig {
             workers: 1,
-            timeout: Duration::from_millis(10),
+            poll_interval: Duration::from_millis(10),
         };
 
         let queue = JobQueue::new(config, storage.clone()).unwrap();
@@ -406,7 +409,7 @@ mod tests {
 
         let config = JobQueueConfig {
             workers: 2,
-            timeout: Duration::from_millis(10),
+            poll_interval: Duration::from_millis(10),
         };
 
         let queue = JobQueue::new(config, storage.clone()).unwrap();
@@ -425,7 +428,7 @@ mod tests {
 
         let config = JobQueueConfig {
             workers: 2,
-            timeout: Duration::from_millis(10),
+            poll_interval: Duration::from_millis(10),
         };
 
         let queue = JobQueue::new(config, storage).unwrap();
@@ -440,7 +443,7 @@ mod tests {
 
         let config = JobQueueConfig {
             workers: 1,
-            timeout: Duration::from_millis(50),
+            poll_interval: Duration::from_millis(50),
         };
 
         let queue = JobQueue::new(config, storage).unwrap();
@@ -455,7 +458,7 @@ mod tests {
         let storage: MemoryStorage<SimpleJob> = MemoryStorage::new();
         let config = JobQueueConfig {
             workers: 1,
-            timeout: Duration::from_millis(10),
+            poll_interval: Duration::from_millis(10),
         };
 
         let queue1 = JobQueue::new(config, storage).unwrap();
@@ -489,7 +492,7 @@ mod tests {
         let config = JobQueueConfig {
             workers: 1,
             // Long poll interval - if it didn't wake up instantly, it would take 5s
-            timeout: Duration::from_secs(5),
+            poll_interval: Duration::from_secs(5),
         };
 
         let queue = JobQueue::new(config, storage.clone()).unwrap();
@@ -519,7 +522,7 @@ mod tests {
 
         let config = JobQueueConfig {
             workers: 1,
-            timeout: Duration::from_millis(500),
+            poll_interval: Duration::from_millis(500),
         };
 
         let queue = JobQueue::new(config, storage.clone()).unwrap();
@@ -557,10 +560,10 @@ mod tests {
         let storage = CountingStorage::new();
 
         // Use a LONG poll interval to easily detect if shutdown waits for it
-        let timeout = Duration::from_secs(5);
+        let poll_interval = Duration::from_secs(5);
         let config = JobQueueConfig {
             workers: 1,
-            timeout,
+            poll_interval,
         };
 
         let queue = JobQueue::new(config, storage.clone()).unwrap();
