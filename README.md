@@ -4,7 +4,8 @@ A storage-agnostic async job queue with configurable workers for Rust.
 
 ## Features
 
-- **Storage Agnostic** - Works with any `Clone + Send + Sync + 'static` type
+- **Multi-Storage** - Single queue can process jobs from multiple storage backends
+- **Storage Agnostic** - Works with any `Send + Sync + 'static` storage backend
 - **Async Workers** - Spawns configurable number of concurrent worker tasks
 - **Postgres Support** - Built-in diesel macro support (feature-gated)
 - **Memory Storage** - In-memory implementation for testing
@@ -13,8 +14,9 @@ A storage-agnostic async job queue with configurable workers for Rust.
 ## Quick Start
 
 ```rust
-use fast_job_queue::{Job, JobQueue, JobQueueConfig, MemoryStorage, Storage};
+use fast_job_queue::{Job, JobQueue, MemoryStorage, Storage};
 use std::convert::Infallible;
+use std::time::Duration;
 
 struct EmailJob { to: String, body: String }
 
@@ -30,21 +32,46 @@ impl Job<MemoryStorage<EmailJob>> for EmailJob {
 #[tokio::main]
 async fn main() {
     let storage = MemoryStorage::new();
-    let queue = JobQueue::new(JobQueueConfig::default(), storage.clone()).unwrap();
+
+    let queue = JobQueue::builder()
+        .workers(4)
+        .poll_interval(Duration::from_secs(1))
+        .with_storage(storage.clone())
+        .build()
+        .unwrap();
 
     // Push jobs through storage
     storage.push(EmailJob { to: "user@example.com".into(), body: "Hello!".into() }).await.unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     queue.shutdown().await.unwrap();
 }
 ```
 
+## Multi-Storage Queue
+
+A single queue can poll jobs from multiple storage backends:
+
+```rust,ignore
+let queue = JobQueue::builder()
+    .workers(4)
+    .poll_interval(Duration::from_millis(100))
+    .with_storage(transcription_storage)  // Postgres-backed
+    .with_storage(translation_storage)    // Postgres-backed
+    .with_storage(email_storage)          // Memory-backed
+    .build()?;
+
+// Single shutdown stops all workers
+queue.shutdown().await?;
+```
+
+Workers poll all storages and process the first available job.
+
 ## With Postgres
 
 ```rust,ignore
-use fast_job_queue::{impl_diesel_pop, Job, JobQueue, JobQueueConfig, Storage};
+use fast_job_queue::{impl_diesel_pop, Job, JobQueue, Storage};
 use std::convert::Infallible;
 
 // Your storage wraps a database pool
@@ -62,15 +89,16 @@ impl Storage for MyStorage {
 
     async fn pop(&self) -> Result<Option<Self::Job>, Self::Error> {
         impl_diesel_pop!(
-            self.pool,
-            get_connection,
-            schema::jobs::table,
-            schema::jobs::id,
-            schema::jobs::status,
-            JobStatus::Pending => JobStatus::Running,
-            MyJob,
-            Uuid,
-            MyDbError
+            pool: self.pool,
+            get_connection: get_connection,
+            table: schema::jobs::table,
+            id_column: schema::jobs::id,
+            status_column: schema::jobs::status,
+            pending_status: JobStatus::Pending,
+            running_status: JobStatus::Running,
+            model: MyJob,
+            id_type: Uuid,
+            error_type: MyDbError,
         )
     }
 }
@@ -89,13 +117,14 @@ impl Job<MyStorage> for MyJob {
 
 ```
 src/
-├── lib.rs          # Re-exports
-├── job.rs          # Job<S> trait
-├── queue.rs        # JobQueue<S>, JobQueueConfig, JobQueueError
+├── lib.rs           # Re-exports
+├── job.rs           # Job<S> trait
+├── queue.rs         # JobQueueBuilder, JobQueue
+├── storage_list.rs  # StorageList trait (tuple composition)
 └── storage/
-    ├── mod.rs      # Storage trait, MemoryStorage re-export
-    ├── memory.rs   # MemoryStorage (in-memory)
-    └── postgres.rs # impl_diesel_pop! macro
+    ├── mod.rs       # Storage trait, MemoryStorage re-export
+    ├── memory.rs    # MemoryStorage (in-memory)
+    └── postgres.rs  # impl_diesel_pop! macro
 ```
 
 ## Feature Flags
@@ -115,13 +144,13 @@ fast-job-queue = { version = "0.1", features = ["postgres"] }
 
 ```rust
 use std::time::Duration;
-use fast_job_queue::JobQueueConfig;
+use fast_job_queue::JobQueue;
 
-let config = JobQueueConfig {
-    workers: 8,                              // Number of concurrent workers
-    timeout: Duration::from_millis(100), // Polling frequency when idle
-};
-
-// Or use defaults (4 workers, 1s poll interval)
-let config = JobQueueConfig::default();
+let queue = JobQueue::builder()
+    .workers(8)
+    .poll_interval(Duration::from_millis(100))
+    .with_storage(my_storage)
+    .build()?;
 ```
+
+Call `queue.shutdown().await` for graceful shutdown when your service is stopping.

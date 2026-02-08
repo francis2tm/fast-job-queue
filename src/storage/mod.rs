@@ -26,16 +26,27 @@ use crate::Job;
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use fast_job_queue::{Storage, MemoryStorage};
+/// ```rust,no_run
+/// use fast_job_queue::{Job, MemoryStorage, Storage};
+/// use std::convert::Infallible;
 ///
+/// # struct MyJob;
+/// # impl Job<MemoryStorage<MyJob>> for MyJob {
+/// #     type Error = Infallible;
+/// #     async fn execute(self, _storage: &MemoryStorage<MyJob>) -> Result<(), Self::Error> {
+/// #         Ok(())
+/// #     }
+/// # }
+/// # async fn example(my_job: MyJob) -> Result<(), Infallible> {
 /// let storage: MemoryStorage<MyJob> = MemoryStorage::new();
 /// storage.push(my_job).await?;
 /// if let Some(job) = storage.pop().await? {
 ///     job.execute(&storage).await?;
 /// }
+/// # Ok(())
+/// # }
 /// ```
-pub trait Storage: Clone + Send + Sync + 'static {
+pub trait Storage: Sized + Send + Sync + 'static {
     /// The job type this storage holds.
     type Job: Job<Self> + Send + Sync + 'static;
 

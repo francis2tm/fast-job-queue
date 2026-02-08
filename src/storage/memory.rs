@@ -24,14 +24,24 @@ use crate::{Job, Storage};
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use fast_job_queue::{MemoryStorage, Storage};
+/// ```rust,no_run
+/// use fast_job_queue::{Job, MemoryStorage, Storage};
+/// use std::convert::Infallible;
 ///
+/// # struct MyJob;
+/// # impl Job<MemoryStorage<MyJob>> for MyJob {
+/// #     type Error = Infallible;
+/// #     async fn execute(self, _storage: &MemoryStorage<MyJob>) -> Result<(), Self::Error> {
+/// #         Ok(())
+/// #     }
+/// # }
+/// # async fn example(my_job: MyJob) {
 /// let storage: MemoryStorage<MyJob> = MemoryStorage::new();
 /// storage.push(my_job).await.unwrap();
 /// if let Some(job) = storage.pop().await.unwrap() {
 ///     job.execute(&storage).await.unwrap();
 /// }
+/// # }
 /// ```
 pub struct MemoryStorage<J> {
     jobs: Arc<Mutex<VecDeque<J>>>,

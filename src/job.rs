@@ -12,16 +12,17 @@ use std::future::Future;
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use fast_job_queue::Job;
 /// use std::convert::Infallible;
 ///
+/// struct MyStorage;
 /// struct MyJob { id: u64 }
 ///
 /// impl Job<MyStorage> for MyJob {
 ///     type Error = Infallible;
 ///
-///     async fn execute(self, storage: &MyStorage) -> Result<(), Self::Error> {
+///     async fn execute(self, _storage: &MyStorage) -> Result<(), Self::Error> {
 ///         println!("Processing job {}", self.id);
 ///         Ok(())
 ///     }
