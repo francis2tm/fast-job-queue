@@ -4,34 +4,31 @@ A storage-agnostic async job queue with configurable workers for Rust.
 
 ## Features
 
-- **Multi-Storage** - Single queue can process jobs from multiple storage backends
-- **Storage Agnostic** - Works with any `Send + Sync + 'static` storage backend
-- **Async Workers** - Spawns configurable number of concurrent worker tasks
-- **Postgres Support** - Built-in diesel macro support (feature-gated)
-- **Memory Storage** - In-memory implementation for testing
-- **Graceful Shutdown** - Clean worker termination with job completion
+- **Runtime Multi-Storage** - Add any number of storages at runtime
+- **Typed Storage** - Each storage is generic over one static job type
+- **Async Workers** - Spawns configurable concurrent worker tasks
+- **Graceful Shutdown** - Consuming shutdown waits for workers
+- **Postgres Helper** - `impl_diesel_pop!` macro (feature-gated)
+- **Memory Storage** - In-memory storage for testing and simple cases
 
 ## Quick Start
 
 ```rust
-use fast_job_queue::{Job, JobQueue, MemoryStorage, Storage};
-use std::convert::Infallible;
+use fast_job_queue::{Job, JobQueue, MemoryStorage, StorageError};
 use std::time::Duration;
 
-struct EmailJob { to: String, body: String }
+struct EmailJob;
 
-impl Job<MemoryStorage<EmailJob>> for EmailJob {
-    type Error = Infallible;
-
-    async fn execute(self, _storage: &MemoryStorage<EmailJob>) -> Result<(), Infallible> {
-        println!("Sending email to {}", self.to);
+impl Job for EmailJob {
+    async fn execute(self) -> Result<(), StorageError> {
+        println!("sending email");
         Ok(())
     }
 }
 
 #[tokio::main]
 async fn main() {
-    let storage = MemoryStorage::new();
+    let storage = MemoryStorage::<EmailJob>::new();
 
     let queue = JobQueue::builder()
         .workers(4)
@@ -40,117 +37,158 @@ async fn main() {
         .build()
         .unwrap();
 
-    // Push jobs through storage
-    storage.push(EmailJob { to: "user@example.com".into(), body: "Hello!".into() }).await.unwrap();
+    storage.job_push(EmailJob).await;
 
     tokio::time::sleep(Duration::from_secs(1)).await;
-
     queue.shutdown().await.unwrap();
 }
 ```
 
-## Multi-Storage Queue
+## E2E: Service Wrapper Lifecycle
 
-A single queue can poll jobs from multiple storage backends:
+```rust,no_run
+use fast_job_queue::{Job, JobQueue, JobQueueError, MemoryStorage, StorageError};
+use std::{sync::Arc, time::Duration};
+use tokio::sync::Mutex;
 
-```rust,ignore
-let queue = JobQueue::builder()
-    .workers(4)
-    .poll_interval(Duration::from_millis(100))
-    .with_storage(transcription_storage)  // Postgres-backed
-    .with_storage(translation_storage)    // Postgres-backed
-    .with_storage(email_storage)          // Memory-backed
-    .build()?;
-
-// Single shutdown stops all workers
-queue.shutdown().await?;
-```
-
-Workers poll all storages and process the first available job.
-
-## With Postgres
-
-```rust,ignore
-use fast_job_queue::{impl_diesel_pop, Job, JobQueue, Storage};
-use std::convert::Infallible;
-
-// Your storage wraps a database pool
-#[derive(Clone)]
-struct MyStorage { pool: MyDbPool }
-
-impl Storage for MyStorage {
-    type Job = MyJob;
-    type Error = MyDbError;
-
-    async fn push(&self, _job: Self::Job) -> Result<(), Self::Error> {
-        // Insert job into database or unimplemented if using API handlers
-        unimplemented!("Use API handlers to insert jobs")
-    }
-
-    async fn pop(&self) -> Result<Option<Self::Job>, Self::Error> {
-        impl_diesel_pop!(
-            pool: self.pool,
-            get_connection: get_connection,
-            table: schema::jobs::table,
-            id_column: schema::jobs::id,
-            status_column: schema::jobs::status,
-            pending_status: JobStatus::Pending,
-            running_status: JobStatus::Running,
-            model: MyJob,
-            id_type: Uuid,
-            error_type: MyDbError,
-        )
-    }
+struct EmailJob {
+    to: String,
 }
 
-impl Job<MyStorage> for MyJob {
-    type Error = Infallible;
-
-    async fn execute(self, storage: &MyStorage) -> Result<(), Infallible> {
-        // Process job, update status to completed/failed
+impl Job for EmailJob {
+    async fn execute(self) -> Result<(), StorageError> {
+        println!("sent email to {}", self.to);
         Ok(())
     }
 }
+
+#[derive(Clone)]
+struct EmailService {
+    storage: MemoryStorage<EmailJob>,
+    queue: Arc<Mutex<Option<JobQueue>>>,
+}
+
+impl EmailService {
+    fn service_build() -> Self {
+        let storage = MemoryStorage::new();
+        let queue = JobQueue::builder()
+            .workers(2)
+            .poll_interval(Duration::from_millis(100))
+            .with_storage(storage.clone())
+            .build()
+            .unwrap();
+
+        Self {
+            storage,
+            queue: Arc::new(Mutex::new(Some(queue))),
+        }
+    }
+
+    async fn email_enqueue(&self, to: String) {
+        self.storage.job_push(EmailJob { to }).await;
+    }
+
+    async fn service_shutdown(&self) -> Result<(), JobQueueError> {
+        match self.queue.lock().await.take() {
+            Some(queue) => queue.shutdown().await,
+            None => Ok(()),
+        }
+    }
+}
 ```
 
-## Architecture
+## E2E: One Queue, Multiple Job Types
 
+```rust,no_run
+use fast_job_queue::{Job, JobQueue, MemoryStorage, StorageError};
+use std::time::Duration;
+
+struct EmailJob;
+struct CleanupJob;
+
+impl Job for EmailJob {
+    async fn execute(self) -> Result<(), StorageError> {
+        println!("email sent");
+        Ok(())
+    }
+}
+
+impl Job for CleanupJob {
+    async fn execute(self) -> Result<(), StorageError> {
+        println!("cleanup completed");
+        Ok(())
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let email_storage = MemoryStorage::<EmailJob>::new();
+    let cleanup_storage = MemoryStorage::<CleanupJob>::new();
+
+    let queue = JobQueue::builder()
+        .workers(4)
+        .poll_interval(Duration::from_millis(100))
+        .with_storage(email_storage.clone())
+        .with_storage(cleanup_storage.clone())
+        .build()
+        .unwrap();
+
+    email_storage.job_push(EmailJob).await;
+    cleanup_storage.job_push(CleanupJob).await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    queue.shutdown().await.unwrap();
+}
 ```
-src/
-├── lib.rs           # Re-exports
-├── job.rs           # Job<S> trait
-├── queue.rs         # JobQueueBuilder, JobQueue
-├── storage_list.rs  # StorageList trait (tuple composition)
-└── storage/
-    ├── mod.rs       # Storage trait, MemoryStorage re-export
-    ├── memory.rs    # MemoryStorage (in-memory)
-    └── postgres.rs  # impl_diesel_pop! macro
+
+## E2E: Postgres Storage + Worker Queue
+
+Enable the `postgres` feature and use `impl_diesel_pop!` inside your storage implementation.
+
+```rust,ignore
+use fast_job_queue::{impl_diesel_pop, Job, JobQueue, Storage, StorageError};
+use uuid::Uuid;
+
+struct MyJob(JobRow);
+
+impl Job for MyJob {
+    async fn execute(self) -> Result<(), StorageError> {
+        process_job(self.0).await
+    }
+}
+
+impl Storage<MyJob> for MyStorage {
+    async fn job_pop(&self) -> Result<Option<MyJob>, StorageError> {
+        let maybe_job = impl_diesel_pop!(
+            self.pool.clone(),
+            get_connection,
+            schema::jobs::table,
+            schema::jobs::id,
+            schema::jobs::status,
+            JobStatus::Pending => JobStatus::Running,
+            Job,
+            Uuid,
+            MyError
+        )?;
+
+        Ok(maybe_job.map(MyJob::from))
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), fast_job_queue::JobQueueError> {
+    let queue = JobQueue::builder()
+        .workers(8)
+        .poll_interval(std::time::Duration::from_millis(100))
+        .with_storage(MyStorage::new(db_pool))
+        .build()?;
+
+    queue.shutdown().await
+}
 ```
 
 ## Feature Flags
 
-| Feature    | Default | Description                      |
-| ---------- | ------- | -------------------------------- |
-| `postgres` |         | Enables `impl_diesel_pop!` macro |
-
-To use with postgres:
-
-```toml
-[dependencies]
-fast-job-queue = { version = "0.1", features = ["postgres"] }
-```
-
-## Configuration
-
-```rust
-use std::time::Duration;
-use fast_job_queue::JobQueue;
-
-let queue = JobQueue::builder()
-    .workers(8)
-    .poll_interval(Duration::from_millis(100))
-    .with_storage(my_storage)
-    .build()?;
-```
-
-Call `queue.shutdown().await` for graceful shutdown when your service is stopping.
+| Feature    | Default | Description            |
+| ---------- | ------- | ---------------------- |
+| `postgres` |         | Enables `impl_diesel_pop!` |

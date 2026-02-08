@@ -1,52 +1,104 @@
 //! Job queue implementation with configurable workers.
 
-use crate::StorageList;
+use crate::storage::{StorageList, StorageListItem};
+use crate::{ExecuteOutcome, Job, JobQueueError, Storage};
+use futures::future::select_all;
 use std::sync::Arc;
 use std::time::Duration;
-use thiserror::Error;
-use tokio::sync::{Mutex, broadcast};
-use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 
-/// Errors that can occur when using the job queue.
-#[derive(Debug, Error)]
-pub enum JobQueueError {
-    /// Configuration error (e.g., zero workers, zero poll interval).
-    #[error("Invalid configuration: {0}")]
-    InvalidConfig(String),
+const STORAGE_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
-    /// A worker panicked during execution.
-    #[error("Worker panicked: {0}")]
-    WorkerPanicked(String),
+async fn storage_execute_round_robin(
+    storages: &[Arc<dyn StorageListItem>],
+    next_storage: &mut usize,
+) -> bool {
+    for _ in 0..storages.len() {
+        let index = *next_storage;
+        *next_storage = (*next_storage + 1) % storages.len();
+
+        match storages[index].execute_one().await {
+            Ok(ExecuteOutcome::Executed) => return true,
+            Ok(ExecuteOutcome::Empty) => {}
+            Err(error) => warn!(storage_index = index, error = %error, "Storage execute failed"),
+        }
+    }
+
+    false
+}
+
+async fn storages_wait_for_any(storages: &[Arc<dyn StorageListItem>], timeout: Duration) {
+    let waiters: Vec<_> = storages
+        .iter()
+        .map(|storage| storage.wait_for_job(timeout))
+        .collect();
+
+    let (result, _, _) = select_all(waiters).await;
+    if let Err(error) = result {
+        warn!(error = %error, "Storage wait failed");
+        tokio::time::sleep(STORAGE_ERROR_BACKOFF).await;
+    }
+}
+
+async fn worker_run(
+    worker_id: usize,
+    storages: Arc<[Arc<dyn StorageListItem>]>,
+    poll_interval: Duration,
+    cancellation: CancellationToken,
+) {
+    let mut next_storage = worker_id % storages.len();
+    debug!(worker_id, "Worker starting");
+
+    loop {
+        if cancellation.is_cancelled() {
+            debug!(worker_id, "Worker received shutdown signal");
+            break;
+        }
+
+        if storage_execute_round_robin(&storages, &mut next_storage).await {
+            debug!(worker_id, "Worker executed job");
+            continue;
+        }
+
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                debug!(worker_id, "Worker received shutdown signal while waiting");
+                break;
+            }
+            _ = storages_wait_for_any(&storages, poll_interval) => {}
+        }
+    }
+
+    debug!(worker_id, "Worker shutting down");
 }
 
 /// Builder for job queues.
 ///
 /// Use [`JobQueue::builder()`] to create a new builder.
-pub struct JobQueueBuilder<S> {
+pub struct JobQueueBuilder {
     workers: usize,
     poll_interval: Duration,
-    storages: S,
+    storages: StorageList,
 }
 
-impl Default for JobQueueBuilder<()> {
+impl Default for JobQueueBuilder {
     fn default() -> Self {
         Self {
             workers: 4,
             poll_interval: Duration::from_secs(1),
-            storages: (),
+            storages: StorageList::new(),
         }
     }
 }
 
-impl JobQueueBuilder<()> {
+impl JobQueueBuilder {
     /// Create a new job queue builder with default configuration.
     pub fn new() -> Self {
         Self::default()
     }
-}
 
-impl<S: StorageList> JobQueueBuilder<S> {
     /// Set the number of concurrent worker tasks.
     /// Default is 4.
     pub fn workers(mut self, workers: usize) -> Self {
@@ -64,123 +116,90 @@ impl<S: StorageList> JobQueueBuilder<S> {
     /// Add a storage backend to the queue.
     ///
     /// Multiple storages can be added; workers poll all of them.
-    pub fn with_storage<T: crate::Storage>(self, storage: T) -> JobQueueBuilder<(Arc<T>, S)> {
-        JobQueueBuilder {
-            workers: self.workers,
-            poll_interval: self.poll_interval,
-            storages: (Arc::new(storage), self.storages),
-        }
+    pub fn with_storage<StorageType, JobType>(mut self, storage: StorageType) -> Self
+    where
+        StorageType: Storage<JobType>,
+        JobType: Job,
+    {
+        self.storages.storage_push(storage);
+        self
+    }
+
+    /// Add a pre-shared storage backend to the queue.
+    pub fn with_storage_arc<StorageType, JobType>(mut self, storage: Arc<StorageType>) -> Self
+    where
+        StorageType: Storage<JobType>,
+        JobType: Job,
+    {
+        self.storages.storage_push(storage);
+        self
     }
 
     /// Build and start the queue, spawning worker tasks.
     ///
     /// # Errors
     ///
-    /// Returns [`JobQueueError::InvalidConfig`] if:
-    /// - `workers` is 0
-    /// - `poll_interval` is 0
+    /// Returns:
+    /// - [`JobQueueError::WorkersMustBePositive`] if `workers` is 0
+    /// - [`JobQueueError::PollIntervalMustBePositive`] if `poll_interval` is 0
+    /// - [`JobQueueError::MissingStorages`] if no storage backends are configured
     #[must_use = "job queue must be stored to keep workers running"]
-    pub fn build(self) -> Result<JobQueue<S>, JobQueueError> {
+    pub fn build(self) -> Result<JobQueue, JobQueueError> {
         if self.workers == 0 {
-            return Err(JobQueueError::InvalidConfig(
-                "workers must be greater than 0".into(),
-            ));
+            return Err(JobQueueError::WorkersMustBePositive);
         }
 
-        if self.poll_interval == Duration::from_millis(0) {
-            return Err(JobQueueError::InvalidConfig(
-                "poll_interval must be greater than 0".into(),
-            ));
+        if self.poll_interval.is_zero() {
+            return Err(JobQueueError::PollIntervalMustBePositive);
         }
 
-        let (shutdown_tx, _) = broadcast::channel(1);
-        let storages = Arc::new(self.storages);
+        if self.storages.is_empty() {
+            return Err(JobQueueError::MissingStorages);
+        }
 
-        let mut workers = Vec::with_capacity(self.workers);
+        let storages = self.storages.arc_slice_into();
+        let cancellation = CancellationToken::new();
+        let mut workers = JoinSet::new();
+
         for worker_id in 0..self.workers {
             let storages = storages.clone();
             let poll_interval = self.poll_interval;
-            let mut shutdown_rx = shutdown_tx.subscribe();
-
-            let handle = tokio::spawn(async move {
-                debug!(worker_id, "Worker starting");
-
-                loop {
-                    // Check for shutdown signal
-                    if shutdown_rx.try_recv().is_ok() {
-                        debug!(worker_id, "Worker received shutdown signal");
-                        break;
-                    }
-
-                    // Pop (claim) the next pending job from any storage
-                    if let Some(job) = storages.pop_any().await {
-                        debug!(worker_id, "Worker claimed job");
-                        job.await;
-                        debug!(worker_id, "Job completed");
-                    } else {
-                        // No jobs available, wait for jobs OR shutdown signal
-                        tokio::select! {
-                            _ = storages.wait_for_any(poll_interval) => {}
-                            _ = shutdown_rx.recv() => {
-                                debug!(worker_id, "Worker received shutdown signal while waiting");
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                debug!(worker_id, "Worker shutting down");
+            let cancellation = cancellation.clone();
+            workers.spawn(async move {
+                worker_run(worker_id, storages, poll_interval, cancellation).await;
             });
-
-            workers.push(handle);
         }
 
-        let s = match Arc::try_unwrap(storages) {
-            Ok(s) => s,
-            Err(arc_s) => (*arc_s).clone(),
-        };
-
         Ok(JobQueue {
-            storages: s,
-            inner: Arc::new(JobQueueInner {
-                workers: Mutex::new(workers),
-                shutdown_tx,
-            }),
+            workers,
+            cancellation,
         })
     }
-}
-
-struct JobQueueInner {
-    workers: Mutex<Vec<JoinHandle<()>>>,
-    shutdown_tx: broadcast::Sender<()>,
 }
 
 /// A running job queue.
 ///
 /// Use [`JobQueue::builder()`] to create and configure the queue.
-pub struct JobQueue<S> {
-    storages: S,
-    inner: Arc<JobQueueInner>,
+pub struct JobQueue {
+    workers: JoinSet<()>,
+    cancellation: CancellationToken,
 }
 
-impl JobQueue<()> {
+impl JobQueue {
     /// Create a new job queue builder.
-    pub fn builder() -> JobQueueBuilder<()> {
+    pub fn builder() -> JobQueueBuilder {
         JobQueueBuilder::new()
     }
-}
 
-impl<S: StorageList> JobQueue<S> {
     /// Gracefully shutdown the queue.
     ///
     /// Signals all workers to stop and waits for them to finish their current job.
-    pub async fn shutdown(&self) -> Result<(), JobQueueError> {
-        let _ = self.inner.shutdown_tx.send(());
-        let mut workers = self.inner.workers.lock().await;
+    pub async fn shutdown(mut self) -> Result<(), JobQueueError> {
+        self.cancellation.cancel();
 
-        for (idx, handle) in workers.drain(..).enumerate() {
-            handle.await.map_err(|e| {
-                JobQueueError::WorkerPanicked(format!("Worker {} panicked: {}", idx, e))
+        while let Some(join_result) = self.workers.join_next().await {
+            join_result.map_err(|error| JobQueueError::WorkerPanicked {
+                reason: error.to_string(),
             })?;
         }
 
@@ -189,12 +208,10 @@ impl<S: StorageList> JobQueue<S> {
     }
 }
 
-impl<S: Clone> Clone for JobQueue<S> {
-    fn clone(&self) -> Self {
-        Self {
-            storages: self.storages.clone(),
-            inner: self.inner.clone(),
-        }
+impl Drop for JobQueue {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.workers.detach_all();
     }
 }
 
@@ -205,39 +222,46 @@ impl<S: Clone> Clone for JobQueue<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Job, MemoryStorage, Storage};
-    use std::convert::Infallible;
+    use crate::{Job, JobQueueError, MemoryStorage, StorageError};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // =========================================================================
-    // Builder Tests
-    // =========================================================================
+    enum TestJob {
+        Increment(Arc<AtomicUsize>),
+        Notify(Arc<tokio::sync::Notify>),
+        Sleep(Duration),
+    }
+
+    impl Job for TestJob {
+        async fn execute(self) -> Result<(), StorageError> {
+            match self {
+                Self::Increment(counter) => {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                Self::Notify(notify) => {
+                    notify.notify_one();
+                }
+                Self::Sleep(duration) => {
+                    tokio::time::sleep(duration).await;
+                }
+            }
+
+            Ok(())
+        }
+    }
+
+    type TestStorage = MemoryStorage<TestJob>;
 
     #[test]
     fn builder_default_has_sensible_values() {
         let builder = JobQueueBuilder::default();
         assert_eq!(builder.workers, 4);
         assert_eq!(builder.poll_interval, Duration::from_secs(1));
-    }
-
-    // =========================================================================
-    // Validation Tests
-    // =========================================================================
-
-    #[derive(Debug, Clone)]
-    struct SimpleJob;
-
-    impl Job<MemoryStorage<SimpleJob>> for SimpleJob {
-        type Error = Infallible;
-
-        async fn execute(self, _storage: &MemoryStorage<SimpleJob>) -> Result<(), Infallible> {
-            Ok(())
-        }
+        assert!(builder.storages.is_empty());
     }
 
     #[tokio::test]
     async fn build_rejects_zero_workers() {
-        let storage: MemoryStorage<SimpleJob> = MemoryStorage::new();
+        let storage = TestStorage::new();
 
         let result = JobQueue::builder()
             .workers(0)
@@ -245,15 +269,12 @@ mod tests {
             .with_storage(storage)
             .build();
 
-        match result {
-            Err(e) => assert!(e.to_string().contains("workers must be greater than 0")),
-            Ok(_) => panic!("Expected error for zero workers"),
-        }
+        assert!(matches!(result, Err(JobQueueError::WorkersMustBePositive)));
     }
 
     #[tokio::test]
     async fn build_rejects_zero_poll_interval() {
-        let storage: MemoryStorage<SimpleJob> = MemoryStorage::new();
+        let storage = TestStorage::new();
 
         let result = JobQueue::builder()
             .workers(2)
@@ -261,43 +282,35 @@ mod tests {
             .with_storage(storage)
             .build();
 
-        match result {
-            Err(e) => assert!(
-                e.to_string()
-                    .contains("poll_interval must be greater than 0")
-            ),
-            Ok(_) => panic!("Expected error for zero poll_interval"),
-        }
+        assert!(matches!(
+            result,
+            Err(JobQueueError::PollIntervalMustBePositive)
+        ));
     }
 
-    // =========================================================================
-    // JobQueue Behavior Tests
-    // =========================================================================
-
-    #[derive(Clone)]
-    struct CountingJob {
-        counter: Arc<AtomicUsize>,
+    #[test]
+    fn build_rejects_no_storages() {
+        let result = JobQueue::builder().workers(1).build();
+        assert!(matches!(result, Err(JobQueueError::MissingStorages)));
     }
 
-    impl Job<MemoryStorage<CountingJob>> for CountingJob {
-        type Error = Infallible;
+    async fn counter_wait(counter: &Arc<AtomicUsize>, target: usize) {
+        let wait = async {
+            while counter.load(Ordering::SeqCst) < target {
+                tokio::task::yield_now().await;
+            }
+        };
 
-        async fn execute(self, _storage: &MemoryStorage<CountingJob>) -> Result<(), Infallible> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("timed out waiting for expected counter value");
     }
 
     #[tokio::test]
     async fn processes_single_job() {
         let counter = Arc::new(AtomicUsize::new(0));
-        let storage: MemoryStorage<CountingJob> = MemoryStorage::new();
-        storage
-            .push(CountingJob {
-                counter: counter.clone(),
-            })
-            .await
-            .unwrap();
+        let storage = TestStorage::new();
+        storage.job_push(TestJob::Increment(counter.clone())).await;
 
         let queue = JobQueue::builder()
             .workers(1)
@@ -306,24 +319,18 @@ mod tests {
             .build()
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        counter_wait(&counter, 1).await;
         queue.shutdown().await.unwrap();
-
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn processes_multiple_jobs() {
         let counter = Arc::new(AtomicUsize::new(0));
-        let storage: MemoryStorage<CountingJob> = MemoryStorage::new();
+        let storage = TestStorage::new();
 
         for _ in 0..5 {
-            storage
-                .push(CountingJob {
-                    counter: counter.clone(),
-                })
-                .await
-                .unwrap();
+            storage.job_push(TestJob::Increment(counter.clone())).await;
         }
 
         let queue = JobQueue::builder()
@@ -333,15 +340,14 @@ mod tests {
             .build()
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        counter_wait(&counter, 5).await;
         queue.shutdown().await.unwrap();
-
         assert_eq!(counter.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]
     async fn shutdown_is_graceful() {
-        let storage: MemoryStorage<SimpleJob> = MemoryStorage::new();
+        let storage = TestStorage::new();
 
         let queue = JobQueue::builder()
             .workers(2)
@@ -356,7 +362,7 @@ mod tests {
 
     #[tokio::test]
     async fn idle_workers_respect_timeout() {
-        let storage: MemoryStorage<SimpleJob> = MemoryStorage::new();
+        let storage = TestStorage::new();
 
         let queue = JobQueue::builder()
             .workers(1)
@@ -365,47 +371,16 @@ mod tests {
             .build()
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        queue.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn queue_clone_shares_state() {
-        let storage: MemoryStorage<SimpleJob> = MemoryStorage::new();
-
-        let queue1 = JobQueue::builder()
-            .workers(1)
-            .poll_interval(Duration::from_millis(10))
-            .with_storage(storage)
-            .build()
+        tokio::time::timeout(Duration::from_secs(1), queue.shutdown())
+            .await
+            .expect("shutdown timed out")
             .unwrap();
-
-        let queue2 = queue1.clone();
-
-        // Shutdown through one handle should stop workers for both
-        queue1.shutdown().await.unwrap();
-
-        // Second shutdown should complete immediately
-        queue2.shutdown().await.unwrap();
-    }
-
-    struct NotifyJob {
-        notify: Arc<tokio::sync::Notify>,
-    }
-
-    impl Job<MemoryStorage<NotifyJob>> for NotifyJob {
-        type Error = Infallible;
-        async fn execute(self, _storage: &MemoryStorage<NotifyJob>) -> Result<(), Infallible> {
-            self.notify.notify_one();
-            Ok(())
-        }
     }
 
     #[tokio::test]
-    async fn job_queue_wait_for_job_processes_instantly() {
-        let storage: MemoryStorage<NotifyJob> = MemoryStorage::new();
+    async fn wait_for_job_processes_instantly() {
+        let storage = TestStorage::new();
         let notify = Arc::new(tokio::sync::Notify::new());
-
         let queue = JobQueue::builder()
             .workers(1)
             .poll_interval(Duration::from_secs(5))
@@ -413,75 +388,43 @@ mod tests {
             .build()
             .unwrap();
 
-        // Wait for worker to start waiting
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        storage.job_push(TestJob::Notify(notify.clone())).await;
 
-        storage
-            .push(NotifyJob {
-                notify: notify.clone(),
-            })
-            .await
-            .unwrap();
-
-        // Should process instantly (not wait 5s)
         let result = tokio::time::timeout(Duration::from_millis(200), notify.notified()).await;
-        assert!(result.is_ok(), "Job should be processed instantly");
+        assert!(result.is_ok(), "Job should be processed quickly");
 
         queue.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn job_queue_wait_for_job_shutdown_responsiveness() {
-        let storage: MemoryStorage<SimpleJob> = MemoryStorage::new();
-        let poll_interval = Duration::from_secs(5);
+    async fn shutdown_is_responsive() {
+        let storage = TestStorage::new();
 
         let queue = JobQueue::builder()
             .workers(1)
-            .poll_interval(poll_interval)
+            .poll_interval(Duration::from_secs(5))
             .with_storage(storage)
             .build()
             .unwrap();
 
-        let queue_clone = queue.clone();
         let start = std::time::Instant::now();
-
-        // Give worker time to enter waiting state
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        queue_clone.shutdown().await.unwrap();
-        let elapsed = start.elapsed();
-
+        queue.shutdown().await.unwrap();
         assert!(
-            elapsed < Duration::from_secs(1),
+            start.elapsed() < Duration::from_secs(1),
             "Shutdown took too long: {:?}",
-            elapsed
+            start.elapsed()
         );
     }
-
-    // =========================================================================
-    // Multi-Storage Tests
-    // =========================================================================
 
     #[tokio::test]
     async fn multi_storage_processes_from_all() {
         let counter = Arc::new(AtomicUsize::new(0));
+        let storage_a = TestStorage::new();
+        let storage_b = TestStorage::new();
 
-        let storage_a: MemoryStorage<CountingJob> = MemoryStorage::new();
-        let storage_b: MemoryStorage<CountingJob> = MemoryStorage::new();
-
-        // Push to both storages
-        storage_a
-            .push(CountingJob {
-                counter: counter.clone(),
-            })
-            .await
-            .unwrap();
-        storage_b
-            .push(CountingJob {
-                counter: counter.clone(),
-            })
-            .await
-            .unwrap();
+        for storage in [storage_a.clone(), storage_b.clone()] {
+            storage.job_push(TestJob::Increment(counter.clone())).await;
+        }
 
         let queue = JobQueue::builder()
             .workers(2)
@@ -491,9 +434,40 @@ mod tests {
             .build()
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        counter_wait(&counter, 2).await;
         queue.shutdown().await.unwrap();
-
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn multi_storage_round_robin_prevents_starvation() {
+        let fast_notify = Arc::new(tokio::sync::Notify::new());
+        let fast_storage = TestStorage::new();
+        let busy_storage = TestStorage::new();
+
+        for _ in 0..10 {
+            busy_storage
+                .job_push(TestJob::Sleep(Duration::from_millis(50)))
+                .await;
+        }
+
+        fast_storage
+            .job_push(TestJob::Notify(fast_notify.clone()))
+            .await;
+
+        let queue = JobQueue::builder()
+            .workers(1)
+            .poll_interval(Duration::from_secs(1))
+            .with_storage(fast_storage)
+            .with_storage(busy_storage)
+            .build()
+            .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(200), fast_notify.notified()).await;
+        queue.shutdown().await.unwrap();
+        assert!(
+            result.is_ok(),
+            "Expected non-starved storage to be processed quickly"
+        );
     }
 }
