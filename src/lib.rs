@@ -4,53 +4,58 @@
 //! Built-in implementations are provided:
 //!
 //! - [`MemoryStorage`] - In-memory queue for testing
-//! - Custom storage - Implement the [`Storage`] trait for your backend
+//! - Custom storage - Implement [`Storage<JobType>`] for your backend
 //!
 //! # Architecture
 //!
 //! ```text
-//! ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-//! │   Storage   │◄────│  JobQueue   │────►│    Job      │
-//! │(Memory, DB) │     │ <S:Storage> │     │  (Your Type)│
-//! └─────────────┘     └─────────────┘     └─────────────┘
+//! ┌────────────────────┐     ┌─────────────┐     ┌─────────────┐
+//! │ Storage<A::Job>    │◄────│             │────►│  Job::execute│
+//! ├────────────────────┤     │  JobQueue   │     ├─────────────┤
+//! │ Storage<B::Job>    │◄────│             │────►│  Job::execute│
+//! └────────────────────┘     └─────────────┘     └─────────────┘
 //! ```
 //!
 //! # Quick Start
 //!
-//! ```rust,ignore
-//! use std::convert::Infallible;
-//! use fast_job_queue::{Job, JobQueue, JobQueueConfig, MemoryStorage, Storage};
+//! ```rust,no_run
+//! use std::time::Duration;
+//! use fast_job_queue::{Job, JobQueue, MemoryStorage, StorageError};
 //!
-//! // Define your job type
-//! struct MyJob { id: u64, data: String }
+//! struct PrintJob;
 //!
-//! // Implement Job for your storage
-//! impl Job<MemoryStorage<MyJob>> for MyJob {
-//!     type Error = Infallible;
-//!
-//!     async fn execute(self, _storage: &MemoryStorage<MyJob>) -> Result<(), Infallible> {
-//!         println!("Processing job {}: {}", self.id, self.data);
+//! impl Job for PrintJob {
+//!     async fn execute(self) -> Result<(), StorageError> {
+//!         println!("Processing task");
 //!         Ok(())
 //!     }
 //! }
 //!
-//! // Create storage and queue
-//! let storage = MemoryStorage::new();
-//! let queue = JobQueue::new(JobQueueConfig::default(), storage.clone())?;
+//! #[tokio::main]
+//! async fn main() -> Result<(), fast_job_queue::JobQueueError> {
+//!     let storage_a: MemoryStorage<PrintJob> = MemoryStorage::new();
+//!     let storage_b: MemoryStorage<PrintJob> = MemoryStorage::new();
 //!
-//! // Push jobs through storage
-//! storage.push(MyJob { id: 1, data: "task".into() }).await?;
+//!     let queue = JobQueue::builder()
+//!         .workers(4)
+//!         .poll_interval(Duration::from_millis(100))
+//!         .with_storage(storage_a.clone())
+//!         .with_storage(storage_b.clone())
+//!         .build()?;
 //!
-//! // Queue processes jobs in the background...
-//! tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+//!     storage_a.job_push(PrintJob).await;
 //!
-//! queue.shutdown().await?;
+//!     tokio::time::sleep(Duration::from_millis(100)).await;
+//!
+//!     queue.shutdown().await?;
+//!     Ok(())
+//! }
 //! ```
 
-mod job;
+mod error;
 mod queue;
 mod storage;
 
-pub use job::Job;
-pub use queue::{JobQueue, JobQueueConfig, JobQueueError};
-pub use storage::{MemoryStorage, Storage};
+pub use error::JobQueueError;
+pub use queue::{JobQueue, JobQueueBuilder};
+pub use storage::{ExecuteOutcome, Job, MemoryStorage, Storage, StorageError};
