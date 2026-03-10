@@ -20,6 +20,7 @@
 ///     schema::jobs::table,
 ///     schema::jobs::id,
 ///     schema::jobs::status,
+///     schema::jobs::deleted_at.is_null(),
 ///     JobStatus::Pending => JobStatus::Running,
 ///     Job,
 ///     Uuid,
@@ -34,6 +35,7 @@ macro_rules! impl_diesel_pop {
         $table:expr,
         $id_column:expr,
         $status_column:expr,
+        $extra_filter:expr,
         $pending_status:expr => $running_status:expr,
         $model:ty,
         $id_type:ty,
@@ -49,6 +51,7 @@ macro_rules! impl_diesel_pop {
                 async move {
                     let pending_id: Option<$id_type> = $table
                         .filter($status_column.eq($pending_status))
+                        .filter($extra_filter)
                         .select($id_column)
                         .limit(1)
                         .for_update()
@@ -63,12 +66,14 @@ macro_rules! impl_diesel_pop {
 
                     update($table)
                         .filter($id_column.eq(pending_id))
+                        .filter($extra_filter)
                         .set($status_column.eq($running_status))
                         .execute(conn)
                         .await?;
 
                     let job = $table
                         .filter($id_column.eq(pending_id))
+                        .filter($extra_filter)
                         .select(<$model>::as_select())
                         .first::<$model>(conn)
                         .await?;
