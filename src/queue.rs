@@ -126,10 +126,7 @@ impl JobQueueBuilder {
     }
 
     /// Add a pre-shared storage backend to the queue.
-    pub fn with_storage_arc<StorageType, JobType>(
-        &mut self,
-        storage: Arc<StorageType>,
-    ) -> &mut Self
+    pub fn with_storage_arc<StorageType, JobType>(&mut self, storage: Arc<StorageType>) -> &mut Self
     where
         StorageType: Storage<JobType>,
         JobType: Job,
