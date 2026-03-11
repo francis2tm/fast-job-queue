@@ -36,12 +36,12 @@
 //!     let storage_a: MemoryStorage<PrintJob> = MemoryStorage::new();
 //!     let storage_b: MemoryStorage<PrintJob> = MemoryStorage::new();
 //!
-//!     let queue = JobQueue::builder()
+//!     let mut queue_builder = JobQueue::builder()
 //!         .workers(4)
-//!         .poll_interval(Duration::from_millis(100))
-//!         .with_storage(storage_a.clone())
-//!         .with_storage(storage_b.clone())
-//!         .build()?;
+//!         .poll_interval(Duration::from_millis(100));
+//!     queue_builder.with_storage(storage_a.clone());
+//!     queue_builder.with_storage(storage_b.clone());
+//!     let queue = queue_builder.build()?;
 //!
 //!     storage_a.job_push(PrintJob).await;
 //!

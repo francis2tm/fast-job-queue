@@ -116,7 +116,7 @@ impl JobQueueBuilder {
     /// Add a storage backend to the queue.
     ///
     /// Multiple storages can be added; workers poll all of them.
-    pub fn with_storage<StorageType, JobType>(mut self, storage: StorageType) -> Self
+    pub fn with_storage<StorageType, JobType>(&mut self, storage: StorageType) -> &mut Self
     where
         StorageType: Storage<JobType>,
         JobType: Job,
@@ -126,7 +126,10 @@ impl JobQueueBuilder {
     }
 
     /// Add a pre-shared storage backend to the queue.
-    pub fn with_storage_arc<StorageType, JobType>(mut self, storage: Arc<StorageType>) -> Self
+    pub fn with_storage_arc<StorageType, JobType>(
+        &mut self,
+        storage: Arc<StorageType>,
+    ) -> &mut Self
     where
         StorageType: Storage<JobType>,
         JobType: Job,
@@ -262,12 +265,11 @@ mod tests {
     #[tokio::test]
     async fn build_rejects_zero_workers() {
         let storage = TestStorage::new();
-
-        let result = JobQueue::builder()
+        let mut builder = JobQueue::builder()
             .workers(0)
-            .poll_interval(Duration::from_millis(100))
-            .with_storage(storage)
-            .build();
+            .poll_interval(Duration::from_millis(100));
+        builder.with_storage(storage);
+        let result = builder.build();
 
         assert!(matches!(result, Err(JobQueueError::WorkersMustBePositive)));
     }
@@ -275,12 +277,11 @@ mod tests {
     #[tokio::test]
     async fn build_rejects_zero_poll_interval() {
         let storage = TestStorage::new();
-
-        let result = JobQueue::builder()
+        let mut builder = JobQueue::builder()
             .workers(2)
-            .poll_interval(Duration::from_millis(0))
-            .with_storage(storage)
-            .build();
+            .poll_interval(Duration::from_millis(0));
+        builder.with_storage(storage);
+        let result = builder.build();
 
         assert!(matches!(
             result,
@@ -311,13 +312,11 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let storage = TestStorage::new();
         storage.job_push(TestJob::Increment(counter.clone())).await;
-
-        let queue = JobQueue::builder()
+        let mut builder = JobQueue::builder()
             .workers(1)
-            .poll_interval(Duration::from_millis(10))
-            .with_storage(storage)
-            .build()
-            .unwrap();
+            .poll_interval(Duration::from_millis(10));
+        builder.with_storage(storage);
+        let queue = builder.build().unwrap();
 
         counter_wait(&counter, 1).await;
         queue.shutdown().await.unwrap();
@@ -332,13 +331,11 @@ mod tests {
         for _ in 0..5 {
             storage.job_push(TestJob::Increment(counter.clone())).await;
         }
-
-        let queue = JobQueue::builder()
+        let mut builder = JobQueue::builder()
             .workers(2)
-            .poll_interval(Duration::from_millis(10))
-            .with_storage(storage)
-            .build()
-            .unwrap();
+            .poll_interval(Duration::from_millis(10));
+        builder.with_storage(storage);
+        let queue = builder.build().unwrap();
 
         counter_wait(&counter, 5).await;
         queue.shutdown().await.unwrap();
@@ -348,13 +345,11 @@ mod tests {
     #[tokio::test]
     async fn shutdown_is_graceful() {
         let storage = TestStorage::new();
-
-        let queue = JobQueue::builder()
+        let mut builder = JobQueue::builder()
             .workers(2)
-            .poll_interval(Duration::from_millis(10))
-            .with_storage(storage)
-            .build()
-            .unwrap();
+            .poll_interval(Duration::from_millis(10));
+        builder.with_storage(storage);
+        let queue = builder.build().unwrap();
 
         let result = queue.shutdown().await;
         assert!(result.is_ok());
@@ -363,13 +358,11 @@ mod tests {
     #[tokio::test]
     async fn idle_workers_respect_timeout() {
         let storage = TestStorage::new();
-
-        let queue = JobQueue::builder()
+        let mut builder = JobQueue::builder()
             .workers(1)
-            .poll_interval(Duration::from_millis(50))
-            .with_storage(storage)
-            .build()
-            .unwrap();
+            .poll_interval(Duration::from_millis(50));
+        builder.with_storage(storage);
+        let queue = builder.build().unwrap();
 
         tokio::time::timeout(Duration::from_secs(1), queue.shutdown())
             .await
@@ -381,12 +374,11 @@ mod tests {
     async fn wait_for_job_processes_instantly() {
         let storage = TestStorage::new();
         let notify = Arc::new(tokio::sync::Notify::new());
-        let queue = JobQueue::builder()
+        let mut builder = JobQueue::builder()
             .workers(1)
-            .poll_interval(Duration::from_secs(5))
-            .with_storage(storage.clone())
-            .build()
-            .unwrap();
+            .poll_interval(Duration::from_secs(5));
+        builder.with_storage(storage.clone());
+        let queue = builder.build().unwrap();
 
         storage.job_push(TestJob::Notify(notify.clone())).await;
 
@@ -399,13 +391,11 @@ mod tests {
     #[tokio::test]
     async fn shutdown_is_responsive() {
         let storage = TestStorage::new();
-
-        let queue = JobQueue::builder()
+        let mut builder = JobQueue::builder()
             .workers(1)
-            .poll_interval(Duration::from_secs(5))
-            .with_storage(storage)
-            .build()
-            .unwrap();
+            .poll_interval(Duration::from_secs(5));
+        builder.with_storage(storage);
+        let queue = builder.build().unwrap();
 
         let start = std::time::Instant::now();
         queue.shutdown().await.unwrap();
@@ -426,13 +416,12 @@ mod tests {
             storage.job_push(TestJob::Increment(counter.clone())).await;
         }
 
-        let queue = JobQueue::builder()
+        let mut builder = JobQueue::builder()
             .workers(2)
-            .poll_interval(Duration::from_millis(10))
-            .with_storage(storage_a)
-            .with_storage(storage_b)
-            .build()
-            .unwrap();
+            .poll_interval(Duration::from_millis(10));
+        builder.with_storage(storage_a);
+        builder.with_storage(storage_b);
+        let queue = builder.build().unwrap();
 
         counter_wait(&counter, 2).await;
         queue.shutdown().await.unwrap();
@@ -455,13 +444,12 @@ mod tests {
             .job_push(TestJob::Notify(fast_notify.clone()))
             .await;
 
-        let queue = JobQueue::builder()
+        let mut builder = JobQueue::builder()
             .workers(1)
-            .poll_interval(Duration::from_secs(1))
-            .with_storage(fast_storage)
-            .with_storage(busy_storage)
-            .build()
-            .unwrap();
+            .poll_interval(Duration::from_secs(1));
+        builder.with_storage(fast_storage);
+        builder.with_storage(busy_storage);
+        let queue = builder.build().unwrap();
 
         let result = tokio::time::timeout(Duration::from_millis(200), fast_notify.notified()).await;
         queue.shutdown().await.unwrap();
